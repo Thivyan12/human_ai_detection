@@ -13,30 +13,128 @@ with open("artifacts/final_updated_model.pkl", "rb") as f:
 # ---------------- FEATURE EXTRACTION ----------------
 def extract_features_from_audio_bytes(audio_bytes: bytes) -> np.ndarray:
     """
-    Decode MP3 bytes → waveform → extract 4 features
+    Decode audio bytes → waveform → extract 6 features
     """
     y, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000, mono=True)
 
     if len(y) == 0:
         raise ValueError("Empty or corrupted audio")
 
+    # Loudness normalize
+    y = librosa.util.normalize(y)
+
     # 1. MFCC variability
     mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-    mfcc_var = np.std(np.std(mfccs, axis=1))
+    mfcc_variability = np.mean(np.std(mfccs, axis=1))
 
     # 2. ZCR variability
     zcr = librosa.feature.zero_crossing_rate(y)[0]
-    zcr_var = np.std(zcr)
+    zcr_variability = np.std(zcr)
 
     # 3. Energy CV
     rms = librosa.feature.rms(y=y)[0]
-    energy_cv = np.std(rms) / (np.mean(rms) + 1e-8)
+    energy_cv = np.std(rms) / (np.mean(rms) + 1e-6)
 
-    # 4. Voiced-frame ratio
-    flatness = librosa.feature.spectral_flatness(y=y)[0]
-    voiced_ratio = np.sum(flatness < 0.1) / len(flatness)
+    # 4. Voiced ratio (pitch presence)
+    pitches, mags = librosa.piptrack(y=y, sr=sr)
+    voiced_frames = np.sum(pitches > 0)
+    total_frames = pitches.size
+    voiced_ratio = voiced_frames / (total_frames + 1e-6)
 
-    return np.array([mfcc_var, zcr_var, energy_cv, voiced_ratio])
+    # 5. Spectral contrast
+    contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+    spectral_contrast = np.mean(np.std(contrast, axis=1))
+
+    # 6. Pitch variability
+    pitch_values = pitches[pitches > 0]
+    if len(pitch_values) > 10:
+        pitch_variability = np.std(pitch_values)
+    else:
+        pitch_variability = 0.0
+
+    return np.array([mfcc_variability, zcr_variability, energy_cv, voiced_ratio, spectral_contrast, pitch_variability])
+
+
+def chunk_audio(y: np.ndarray, sr: int, chunk_duration: float = 5.0) -> list:
+    """
+    Split audio into chunks of specified duration (default 5 seconds)
+    If audio is shorter than chunk_duration, return it as a single chunk
+    """
+    chunk_samples = int(chunk_duration * sr)
+    chunks = []
+    
+    # If audio is shorter than chunk duration, treat entire audio as one chunk
+    if len(y) <= chunk_samples:
+        chunks.append(y)
+    else:
+        # Split into multiple chunks
+        for i in range(0, len(y), chunk_samples):
+            chunk = y[i:i + chunk_samples]
+            # Only include chunks that are at least 1 second long
+            if len(chunk) >= sr:
+                chunks.append(chunk)
+    
+    return chunks
+
+
+def extract_features_from_chunks(audio_bytes: bytes) -> list:
+    """
+    Decode audio → split into 5-sec chunks → extract features from each chunk
+    Returns list of feature arrays (one per chunk)
+    """
+    y, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000, mono=True)
+
+    if len(y) == 0:
+        raise ValueError("Empty or corrupted audio")
+    
+    # Minimum 0.5 seconds required for reliable feature extraction
+    if len(y) < sr * 0.5:
+        raise ValueError("Audio too short (minimum 0.5 seconds required)")
+
+    # Split into 5-second chunks
+    chunks = chunk_audio(y, sr, chunk_duration=5.0)
+    
+    if len(chunks) == 0:
+        raise ValueError("Audio processing error")
+
+    all_features = []
+    
+    for chunk in chunks:
+        # Loudness normalize
+        chunk = librosa.util.normalize(chunk)
+
+        # 1. MFCC variability
+        mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13)
+        mfcc_variability = np.mean(np.std(mfccs, axis=1))
+
+        # 2. ZCR variability
+        zcr = librosa.feature.zero_crossing_rate(chunk)[0]
+        zcr_variability = np.std(zcr)
+
+        # 3. Energy CV
+        rms = librosa.feature.rms(y=chunk)[0]
+        energy_cv = np.std(rms) / (np.mean(rms) + 1e-6)
+
+        # 4. Voiced ratio (pitch presence)
+        pitches, mags = librosa.piptrack(y=chunk, sr=sr)
+        voiced_frames = np.sum(pitches > 0)
+        total_frames = pitches.size
+        voiced_ratio = voiced_frames / (total_frames + 1e-6)
+
+        # 5. Spectral contrast
+        contrast = librosa.feature.spectral_contrast(y=chunk, sr=sr)
+        spectral_contrast = np.mean(np.std(contrast, axis=1))
+
+        # 6. Pitch variability
+        pitch_values = pitches[pitches > 0]
+        if len(pitch_values) > 10:
+            pitch_variability = np.std(pitch_values)
+        else:
+            pitch_variability = 0.0
+
+        all_features.append([mfcc_variability, zcr_variability, energy_cv, voiced_ratio, spectral_contrast, pitch_variability])
+    
+    return all_features
 
 
 # ---------------- EXPLANATION LOGIC ----------------
@@ -44,7 +142,7 @@ def generate_explanation(raw_features: np.ndarray, confidence: float, classifica
     """
     Feature-based, human-readable explanation
     """
-    mfcc_var, zcr_var, energy_cv, voiced_ratio = raw_features
+    mfcc_var, zcr_var, energy_cv, voiced_ratio, spectral_contrast, pitch_var = raw_features
 
     # Low-confidence case
     if confidence < 0.6:
@@ -64,6 +162,10 @@ def generate_explanation(raw_features: np.ndarray, confidence: float, classifica
             indicators.append("steady energy levels")
         if voiced_ratio > 0.85:
             indicators.append("highly regular vocal framing")
+        if spectral_contrast < 15.0:
+            indicators.append("flat frequency distribution")
+        if pitch_var < 50.0:
+            indicators.append("robotic pitch consistency")
         
         if indicators:
             return f"AI-generated speech detected due to {' and '.join(indicators[:2])} suggesting synthetic production."
@@ -81,6 +183,10 @@ def generate_explanation(raw_features: np.ndarray, confidence: float, classifica
             indicators.append("dynamic energy fluctuations")
         if voiced_ratio < 0.75:
             indicators.append("natural speech rhythm")
+        if spectral_contrast > 20.0:
+            indicators.append("rich frequency dynamics")
+        if pitch_var > 100.0:
+            indicators.append("natural pitch modulation")
         
         if indicators:
             return f"Human speech detected with {' and '.join(indicators[:2])} typical of natural voice production."
@@ -91,7 +197,7 @@ def generate_explanation(raw_features: np.ndarray, confidence: float, classifica
 # ---------------- MAIN INFERENCE ----------------
 def run_inference(audio_base64: str) -> dict:
     """
-    Base64 MP3 → prediction result
+    Base64 audio → prediction result (with majority voting on 5-sec chunks)
     """
     # Decode Base64
     try:
@@ -99,23 +205,38 @@ def run_inference(audio_base64: str) -> dict:
     except Exception:
         raise ValueError("Invalid Base64 audio input")
 
-    # Feature extraction
-    raw_features = extract_features_from_audio_bytes(audio_bytes)
+    # Feature extraction with chunking (returns list of feature arrays)
+    chunk_features = extract_features_from_chunks(audio_bytes)
 
-    # Model prediction
-    probabilities = model.predict_proba(raw_features.reshape(1, -1))[0]
-
-    # ⚠️ Ensure label mapping matches your training
-    # Index 1 → AI, Index 0 → HUMAN
-    if probabilities[1] > probabilities[0]:
+    # Classify each chunk and collect votes
+    ai_votes = 0
+    human_votes = 0
+    
+    for features in chunk_features:
+        features_array = np.array(features).reshape(1, -1)
+        prediction = model.predict(features_array)[0]
+        
+        if prediction == 1:  # AI
+            ai_votes += 1
+        else:  # Human
+            human_votes += 1
+    
+    total_chunks = len(chunk_features)
+    
+    # Determine final classification based on majority
+    if ai_votes > human_votes:
         classification = "AI_GENERATED"
-        confidence = float(probabilities[1])
+        confidence = ai_votes / total_chunks
+        # Get average features for explanation
+        avg_features = np.mean(chunk_features, axis=0)
     else:
         classification = "HUMAN"
-        confidence = float(probabilities[0])
+        confidence = human_votes / total_chunks
+        # Get average features for explanation
+        avg_features = np.mean(chunk_features, axis=0)
 
     explanation = generate_explanation(
-        raw_features=raw_features,
+        raw_features=avg_features,
         confidence=confidence,
         classification=classification
     )

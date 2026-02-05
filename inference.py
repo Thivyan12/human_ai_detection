@@ -194,46 +194,62 @@ def generate_explanation(raw_features: np.ndarray, confidence: float, classifica
             return "Human speech detected with natural variations in voice characteristics."
 
 
-# ---------------- MAIN INFERENCE ----------------
 def run_inference(audio_base64: str) -> dict:
     """
-    Base64 audio → prediction result (with majority voting on 5-sec chunks)
+    Base64 audio → prediction result (probability-based aggregation over chunks)
     """
-    # Decode Base64
+    # Decode Base64 (robust to newlines/spaces)
     try:
+        audio_base64 = audio_base64.strip().replace("\n", "").replace("\r", "")
         audio_bytes = base64.b64decode(audio_base64)
-    except Exception:
-        raise ValueError("Invalid Base64 audio input")
+    except Exception as e:
+        raise ValueError(f"Invalid Base64 audio input: {str(e)}")
 
-    # Feature extraction with chunking (returns list of feature arrays)
+    # Feature extraction with chunking
     chunk_features = extract_features_from_chunks(audio_bytes)
 
-    # Classify each chunk and collect votes
-    ai_votes = 0
-    human_votes = 0
+    ai_probabilities = []
+    human_probabilities = []
     
     for features in chunk_features:
         features_array = np.array(features).reshape(1, -1)
-        prediction = model.predict(features_array)[0]
-        
-        if prediction == 1:  # AI
-            ai_votes += 1
-        else:  # Human
-            human_votes += 1
-    
-    total_chunks = len(chunk_features)
-    
-    # Determine final classification based on majority
-    if ai_votes > human_votes:
+
+        # Predict probabilities: [P(HUMAN), P(AI)]
+        probs = model.predict_proba(features_array)[0]
+
+        human_probabilities.append(float(probs[0]))
+        ai_probabilities.append(float(probs[1]))
+
+    # Average probabilities across all chunks
+    avg_human_prob = float(np.mean(human_probabilities))
+    avg_ai_prob = float(np.mean(ai_probabilities))
+
+    # Calculate variance/uncertainty across chunks
+    human_std = np.std(human_probabilities)
+    ai_std = np.std(ai_probabilities)
+
+    # Final classification based on higher average probability
+    if avg_ai_prob > avg_human_prob:
         classification = "AI_GENERATED"
-        confidence = ai_votes / total_chunks
-        # Get average features for explanation
-        avg_features = np.mean(chunk_features, axis=0)
+        raw_confidence = avg_ai_prob
+        uncertainty = float(ai_std)
     else:
         classification = "HUMAN"
-        confidence = human_votes / total_chunks
-        # Get average features for explanation
-        avg_features = np.mean(chunk_features, axis=0)
+        raw_confidence = avg_human_prob
+        uncertainty = float(human_std)
+
+    # Apply calibration to avoid extreme confidence scores
+    # Calibration formula: adjusted = 0.5 + (raw - 0.5) * scaling_factor - uncertainty_penalty
+    scaling_factor = 0.8  # Reduces extreme predictions
+    uncertainty_penalty = uncertainty * 0.3  # Penalize inconsistent predictions
+
+    confidence = 0.5 + (raw_confidence - 0.5) * scaling_factor - uncertainty_penalty
+
+    # Ensure confidence stays in reasonable bounds [0.51, 0.95]
+    confidence = max(0.51, min(0.95, confidence))
+
+    # Average features for explanation
+    avg_features = np.mean(chunk_features, axis=0)
 
     explanation = generate_explanation(
         raw_features=avg_features,

@@ -6,7 +6,7 @@ import numpy as np
 import librosa
 
 # ---------------- LOAD MODEL ----------------
-with open("artifacts/best_model_baseline.pkl", "rb") as f:
+with open("artifacts/final_updated_model.pkl", "rb") as f:
     model = pickle.load(f)
 
 
@@ -42,26 +42,50 @@ def extract_features_from_audio_bytes(audio_bytes: bytes) -> np.ndarray:
 # ---------------- EXPLANATION LOGIC ----------------
 def generate_explanation(raw_features: np.ndarray, confidence: float, classification: str) -> str:
     """
-    Confidence-aware, human-readable explanation
-    (no feature leakage, no external stats)
+    Feature-based, human-readable explanation
     """
+    mfcc_var, zcr_var, energy_cv, voiced_ratio = raw_features
 
     # Low-confidence case
     if confidence < 0.6:
         return (
-            "The audio exhibits mixed acoustic characteristics and does not "
-            "strongly align with typical human or AI-generated speech patterns"
+            "The audio exhibits mixed acoustic characteristics that do not strongly align with typical human or AI-generated speech patterns."
         )
 
-    # Higher confidence explanations
+    # Feature-based explanations
     if classification == "AI_GENERATED":
-        return (
-            "Unnatural pitch consistency and robotic speech patterns detected"
-        )
-    else:
-        return (
-            "Natural variations in pitch, energy, and speech flow detected"
-        )
+        # Determine primary indicators
+        indicators = []
+        if mfcc_var < 2.0:
+            indicators.append("unusually consistent pitch patterns")
+        if zcr_var < 0.02:
+            indicators.append("uniform voice texture")
+        if energy_cv < 0.3:
+            indicators.append("steady energy levels")
+        if voiced_ratio > 0.85:
+            indicators.append("highly regular vocal framing")
+        
+        if indicators:
+            return f"AI-generated speech detected due to {' and '.join(indicators[:2])} suggesting synthetic production."
+        else:
+            return "AI-generated speech detected with robotic consistency in voice characteristics."
+    
+    else:  # HUMAN
+        # Determine primary indicators
+        indicators = []
+        if mfcc_var > 3.0:
+            indicators.append("natural pitch variations")
+        if zcr_var > 0.04:
+            indicators.append("organic voice texture changes")
+        if energy_cv > 0.5:
+            indicators.append("dynamic energy fluctuations")
+        if voiced_ratio < 0.75:
+            indicators.append("natural speech rhythm")
+        
+        if indicators:
+            return f"Human speech detected with {' and '.join(indicators[:2])} typical of natural voice production."
+        else:
+            return "Human speech detected with natural variations in voice characteristics."
 
 
 # ---------------- MAIN INFERENCE ----------------

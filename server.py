@@ -13,6 +13,10 @@ class VoiceDetectionRequest(BaseModel):
     audioFormat: str
     audioBase64: str
 
+@app.on_event("startup")
+def startup_event():
+    print("✅ AI Voice Detection API is live")
+
 
 # ---------------- API HANDLER ----------------
 @app.post("/api/voice-detection")

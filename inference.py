@@ -5,260 +5,353 @@ import pickle
 import numpy as np
 import librosa
 
-# ---------------- LOAD MODEL ----------------
-with open("artifacts/final_updated_model.pkl", "rb") as f:
+
+# ==================== LOAD MODEL ====================
+with open("artifacts/final_voice_detection_model.pkl", "rb") as f:
     model = pickle.load(f)
 
 
-# ---------------- FEATURE EXTRACTION ----------------
-def extract_features_from_audio_bytes(audio_bytes: bytes) -> np.ndarray:
+# =========================================================
+# =============== CHUNK SELECTION (FIXED THRESHOLD) =======
+# =========================================================
+
+def calculate_speech_duration(chunk, sr):
     """
-    Decode audio bytes → waveform → extract 6 features
+    PRODUCTION-READY speech duration calculator
+    Uses fixed threshold for consistency across chunks
+    
+    Args:
+        chunk: Audio chunk (numpy array)
+        sr: Sample rate
+    
+    Returns:
+        speech_duration: Duration of speech content in seconds
     """
-    y, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000, mono=True)
+    frame_length = int(0.025 * sr)  # 25 ms
+    hop_length = int(0.010 * sr)    # 10 ms
+    
+    # Normalize chunk first (CRITICAL!)
+    chunk = librosa.util.normalize(chunk)
+    
+    # Calculate RMS energy per frame
+    rms = librosa.feature.rms(
+        y=chunk,
+        frame_length=frame_length,
+        hop_length=hop_length
+    )[0]
+    
+    # Fixed threshold (empirically validated for normalized audio)
+    SPEECH_THRESHOLD = 0.02
+    
+    # Count speech frames
+    speech_frames = rms > SPEECH_THRESHOLD
+    speech_duration = np.sum(speech_frames) * (hop_length / sr)
+    
+    return speech_duration
 
-    if len(y) == 0:
-        raise ValueError("Empty or corrupted audio")
 
-    # Loudness normalize
-    y = librosa.util.normalize(y)
+def should_accept_chunk(chunk, sr, min_speech_duration=2.0):
+    """
+    Accept chunk if it has >= 2 seconds of speech
+    
+    Args:
+        chunk: Audio chunk
+        sr: Sample rate
+        min_speech_duration: Minimum speech required (default 2.0 sec)
+    
+    Returns:
+        accept: Whether to accept this chunk
+        speech_duration: Actual speech duration
+        weight: Quality weight for aggregation
+    """
+    speech_duration = calculate_speech_duration(chunk, sr)
+    
+    # Decision rule
+    accept = speech_duration >= min_speech_duration
+    
+    # Calculate weight based on speech content
+    chunk_duration = len(chunk) / sr
+    speech_ratio = speech_duration / chunk_duration
+    weight = min(1.0, speech_ratio / 0.5)  # Full weight at 50% speech
+    
+    return accept, speech_duration, weight
 
+
+# =========================================================
+# ================= FEATURE EXTRACTION ====================
+# =========================================================
+
+def extract_features(chunk, sr):
+    """
+    Extract 6 acoustic features from a single chunk
+    
+    Features:
+    1. MFCC variability
+    2. ZCR variability
+    3. Energy CV (Coefficient of Variation)
+    4. Voiced ratio
+    5. Spectral contrast
+    6. Pitch variability
+    
+    Args:
+        chunk: Audio chunk
+        sr: Sample rate
+    
+    Returns:
+        features: 6-element feature vector
+    """
+    # Normalize chunk
+    chunk = librosa.util.normalize(chunk)
+    
     # 1. MFCC variability
-    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-    mfcc_variability = np.mean(np.std(mfccs, axis=1))
-
+    mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13)
+    mfcc_var = np.mean(np.std(mfccs, axis=1))
+    
     # 2. ZCR variability
-    zcr = librosa.feature.zero_crossing_rate(y)[0]
-    zcr_variability = np.std(zcr)
-
-    # 3. Energy CV
-    rms = librosa.feature.rms(y=y)[0]
+    zcr = librosa.feature.zero_crossing_rate(chunk)[0]
+    zcr_var = np.std(zcr)
+    
+    # 3. Energy CV (Coefficient of Variation)
+    rms = librosa.feature.rms(y=chunk)[0]
     energy_cv = np.std(rms) / (np.mean(rms) + 1e-6)
-
+    
     # 4. Voiced ratio (pitch presence)
-    pitches, mags = librosa.piptrack(y=y, sr=sr)
-    voiced_frames = np.sum(pitches > 0)
-    total_frames = pitches.size
-    voiced_ratio = voiced_frames / (total_frames + 1e-6)
-
+    pitches, _ = librosa.piptrack(y=chunk, sr=sr)
+    voiced_ratio = np.sum(pitches > 0) / (pitches.size + 1e-6)
+    
     # 5. Spectral contrast
-    contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+    contrast = librosa.feature.spectral_contrast(y=chunk, sr=sr)
     spectral_contrast = np.mean(np.std(contrast, axis=1))
-
+    
     # 6. Pitch variability
     pitch_values = pitches[pitches > 0]
-    if len(pitch_values) > 10:
-        pitch_variability = np.std(pitch_values)
-    else:
-        pitch_variability = 0.0
+    pitch_var = np.std(pitch_values) if len(pitch_values) > 10 else 0.0
+    
+    return np.array([
+        mfcc_var,
+        zcr_var,
+        energy_cv,
+        voiced_ratio,
+        spectral_contrast,
+        pitch_var
+    ])
 
-    return np.array([mfcc_variability, zcr_variability, energy_cv, voiced_ratio, spectral_contrast, pitch_variability])
 
+# =========================================================
+# ==================== CHUNKING ===========================
+# =========================================================
 
-def chunk_audio(y: np.ndarray, sr: int, chunk_duration: float = 5.0) -> list:
+def split_chunks(y, sr, duration=5.0):
     """
     Split audio into chunks of specified duration (default 5 seconds)
-    If audio is shorter than chunk_duration, return it as a single chunk
+    
+    Args:
+        y: Audio waveform
+        sr: Sample rate
+        duration: Duration of each chunk in seconds
+    
+    Returns:
+        chunks: List of audio chunks
     """
-    chunk_samples = int(chunk_duration * sr)
-    chunks = []
-    
-    # If audio is shorter than chunk duration, treat entire audio as one chunk
-    if len(y) <= chunk_samples:
-        chunks.append(y)
-    else:
-        # Split into multiple chunks
-        for i in range(0, len(y), chunk_samples):
-            chunk = y[i:i + chunk_samples]
-            # Only include chunks that are at least 1 second long
-            if len(chunk) >= sr:
-                chunks.append(chunk)
-    
-    return chunks
+    size = int(sr * duration)
+    return [y[i:i+size] for i in range(0, len(y), size) if len(y[i:i+size]) >= sr]
 
 
-def extract_features_from_chunks(audio_bytes: bytes) -> list:
+# =========================================================
+# =================== AGGREGATION =========================
+# =========================================================
+
+def normalized_weighted_log_odds(ai_probs, weights):
     """
-    Decode audio → split into 5-sec chunks → extract features from each chunk
-    Returns list of feature arrays (one per chunk)
+    Normalized Weighted Log-Odds Fusion
+    
+    Mathematically principled approach that:
+    1. Respects nonlinear probability scale
+    2. Weights evidence by chunk quality
+    3. Normalizes to prevent length bias
+    4. Avoids correlation inflation
+    
+    Args:
+        ai_probs: List of AI probabilities per chunk
+        weights: Corresponding chunk weights
+    
+    Returns:
+        final_prob: Aggregated AI probability
     """
+    ai_probs = np.array(ai_probs)
+    weights = np.array(weights)
+    
+    # Clip probabilities to avoid log(0) or log(1)
+    ai_probs = np.clip(ai_probs, 1e-6, 1 - 1e-6)
+    
+    # Convert to log-odds (evidence space)
+    logits = np.log(ai_probs / (1 - ai_probs))
+    
+    # Normalized weighted aggregation
+    final_logit = np.sum(weights * logits) / np.sum(weights)
+    
+    # Convert back to probability space
+    final_prob = 1 / (1 + np.exp(-final_logit))
+    
+    return float(final_prob)
+
+
+# =========================================================
+# ================= DECISION LOGIC ========================
+# =========================================================
+
+def final_binary_decision(final_prob, chunk_probs):
+    """
+    Deterministic binary classification with three-stage tie-breaking
+    
+    Stage 1: Use aggregated probability (log-odds fusion)
+    Stage 2: Use mean probability (simple average)
+    Stage 3: Default to HUMAN (safer bias)
+    
+    Args:
+        final_prob: Aggregated AI probability from log-odds fusion
+        chunk_probs: Original chunk-level AI probabilities
+    
+    Returns:
+        classification: "AI_GENERATED" or "HUMAN"
+    """
+    # Stage 1: Primary Decision
+    if final_prob > 0.5:
+        return "AI_GENERATED"
+    
+    if final_prob < 0.5:
+        return "HUMAN"
+    
+    # Stage 2: Tie Resolver (final_prob == 0.5)
+    # Use simple mean as secondary evidence
+    mean_prob = np.mean(chunk_probs)
+    
+    if mean_prob > 0.5:
+        return "AI_GENERATED"
+    
+    if mean_prob < 0.5:
+        return "HUMAN"
+    
+    # Stage 3: Absolute Tie Fallback
+    # Default to HUMAN (safer classification bias)
+    return "HUMAN"
+
+
+# =========================================================
+# ================== EXPLANATION ENGINE ===================
+# =========================================================
+
+def generate_explanation(prob):
+    """
+    Generate human-readable explanation based on final probability
+    
+    Args:
+        prob: Final AI probability
+    
+    Returns:
+        explanation: Human-readable explanation string
+    """
+    if prob > 0.85:
+        return "Strong synthetic speech patterns detected."
+    
+    if prob > 0.65:
+        return "Speech characteristics indicate likely AI generation."
+    
+    if prob > 0.55:
+        return "Subtle synthetic patterns detected."
+    
+    if prob < 0.15:
+        return "Strong natural speech characteristics detected."
+    
+    if prob < 0.35:
+        return "Speech patterns consistent with human voice."
+    
+    return "Mixed acoustic signals detected."
+
+
+# =========================================================
+# ===================== MAIN PIPELINE =====================
+# =========================================================
+
+def run_inference(audio_base64: str):
+    """
+    Complete inference pipeline: Base64 → Classification
+    
+    Pipeline:
+    1. Decode Base64 → audio bytes
+    2. Load audio → waveform
+    3. Chunk audio (5-sec chunks)
+    4. Filter chunks (≥2 sec speech)
+    5. Extract features (6 features per chunk)
+    6. Get model predictions
+    7. Aggregate using normalized weighted log-odds
+    8. Apply three-stage decision logic
+    9. Calculate confidence (probability of predicted class)
+    10. Generate explanation
+    
+    Args:
+        audio_base64: Base64-encoded MP3 audio
+    
+    Returns:
+        result: Dictionary with classification, confidence, explanation
+    """
+    # ===== STEP 1: Decode Base64 =====
+    try:
+        audio_bytes = base64.b64decode(audio_base64.strip())
+    except Exception:
+        raise ValueError("Invalid base64 audio")
+    
+    # ===== STEP 2: Load Waveform =====
     y, sr = librosa.load(io.BytesIO(audio_bytes), sr=16000, mono=True)
-
-    if len(y) == 0:
-        raise ValueError("Empty or corrupted audio")
     
-    # Minimum 0.5 seconds required for reliable feature extraction
     if len(y) < sr * 0.5:
         raise ValueError("Audio too short (minimum 0.5 seconds required)")
-
-    # Split into 5-second chunks
-    chunks = chunk_audio(y, sr, chunk_duration=5.0)
     
-    if len(chunks) == 0:
-        raise ValueError("Audio processing error")
-
-    all_features = []
+    # ===== STEP 3: Split into Chunks =====
+    chunks = split_chunks(y, sr)
     
+    ai_probs = []
+    weights = []
+    
+    # ===== STEP 4-6: Process Each Chunk =====
     for chunk in chunks:
-        # Loudness normalize
-        chunk = librosa.util.normalize(chunk)
-
-        # 1. MFCC variability
-        mfccs = librosa.feature.mfcc(y=chunk, sr=sr, n_mfcc=13)
-        mfcc_variability = np.mean(np.std(mfccs, axis=1))
-
-        # 2. ZCR variability
-        zcr = librosa.feature.zero_crossing_rate(chunk)[0]
-        zcr_variability = np.std(zcr)
-
-        # 3. Energy CV
-        rms = librosa.feature.rms(y=chunk)[0]
-        energy_cv = np.std(rms) / (np.mean(rms) + 1e-6)
-
-        # 4. Voiced ratio (pitch presence)
-        pitches, mags = librosa.piptrack(y=chunk, sr=sr)
-        voiced_frames = np.sum(pitches > 0)
-        total_frames = pitches.size
-        voiced_ratio = voiced_frames / (total_frames + 1e-6)
-
-        # 5. Spectral contrast
-        contrast = librosa.feature.spectral_contrast(y=chunk, sr=sr)
-        spectral_contrast = np.mean(np.std(contrast, axis=1))
-
-        # 6. Pitch variability
-        pitch_values = pitches[pitches > 0]
-        if len(pitch_values) > 10:
-            pitch_variability = np.std(pitch_values)
-        else:
-            pitch_variability = 0.0
-
-        all_features.append([mfcc_variability, zcr_variability, energy_cv, voiced_ratio, spectral_contrast, pitch_variability])
-    
-    return all_features
-
-
-# ---------------- EXPLANATION LOGIC ----------------
-def generate_explanation(raw_features: np.ndarray, confidence: float, classification: str) -> str:
-    """
-    Feature-based, human-readable explanation
-    """
-    mfcc_var, zcr_var, energy_cv, voiced_ratio, spectral_contrast, pitch_var = raw_features
-
-    # Low-confidence case
-    if confidence < 0.6:
-        return (
-            "The audio exhibits mixed acoustic characteristics that do not strongly align with typical human or AI-generated speech patterns."
-        )
-
-    # Feature-based explanations
-    if classification == "AI_GENERATED":
-        # Determine primary indicators
-        indicators = []
-        if mfcc_var < 2.0:
-            indicators.append("unusually consistent pitch patterns")
-        if zcr_var < 0.02:
-            indicators.append("uniform voice texture")
-        if energy_cv < 0.3:
-            indicators.append("steady energy levels")
-        if voiced_ratio > 0.85:
-            indicators.append("highly regular vocal framing")
-        if spectral_contrast < 15.0:
-            indicators.append("flat frequency distribution")
-        if pitch_var < 50.0:
-            indicators.append("robotic pitch consistency")
         
-        if indicators:
-            return f"AI-generated speech detected due to {' and '.join(indicators[:2])} suggesting synthetic production."
-        else:
-            return "AI-generated speech detected with robotic consistency in voice characteristics."
-    
-    else:  # HUMAN
-        # Determine primary indicators
-        indicators = []
-        if mfcc_var > 3.0:
-            indicators.append("natural pitch variations")
-        if zcr_var > 0.04:
-            indicators.append("organic voice texture changes")
-        if energy_cv > 0.5:
-            indicators.append("dynamic energy fluctuations")
-        if voiced_ratio < 0.75:
-            indicators.append("natural speech rhythm")
-        if spectral_contrast > 20.0:
-            indicators.append("rich frequency dynamics")
-        if pitch_var > 100.0:
-            indicators.append("natural pitch modulation")
+        # Check if chunk has sufficient speech
+        accept, speech_dur, weight = should_accept_chunk(chunk, sr)
         
-        if indicators:
-            return f"Human speech detected with {' and '.join(indicators[:2])} typical of natural voice production."
-        else:
-            return "Human speech detected with natural variations in voice characteristics."
-
-
-def run_inference(audio_base64: str) -> dict:
-    """
-    Base64 audio → prediction result (probability-based aggregation over chunks)
-    """
-    # Decode Base64 (robust to newlines/spaces)
-    try:
-        audio_base64 = audio_base64.strip().replace("\n", "").replace("\r", "")
-        audio_bytes = base64.b64decode(audio_base64)
-    except Exception as e:
-        raise ValueError(f"Invalid Base64 audio input: {str(e)}")
-
-    # Feature extraction with chunking
-    chunk_features = extract_features_from_chunks(audio_bytes)
-
-    ai_probabilities = []
-    human_probabilities = []
+        if not accept:
+            continue  # Skip chunks with insufficient speech
+        
+        # Extract 6 features
+        features = extract_features(chunk, sr).reshape(1, -1)
+        
+        # Get model prediction
+        probs = model.predict_proba(features)[0]
+        ai_prob = float(probs[1])
+        
+        # Store results
+        ai_probs.append(ai_prob)
+        weights.append(weight)
     
-    for features in chunk_features:
-        features_array = np.array(features).reshape(1, -1)
-
-        # Predict probabilities: [P(HUMAN), P(AI)]
-        probs = model.predict_proba(features_array)[0]
-
-        human_probabilities.append(float(probs[0]))
-        ai_probabilities.append(float(probs[1]))
-
-    # Average probabilities across all chunks
-    avg_human_prob = float(np.mean(human_probabilities))
-    avg_ai_prob = float(np.mean(ai_probabilities))
-
-    # Calculate variance/uncertainty across chunks
-    human_std = np.std(human_probabilities)
-    ai_std = np.std(ai_probabilities)
-
-    # Final classification based on higher average probability
-    if avg_ai_prob > avg_human_prob:
-        classification = "AI_GENERATED"
-        raw_confidence = avg_ai_prob
-        uncertainty = float(ai_std)
-    else:
-        classification = "HUMAN"
-        raw_confidence = avg_human_prob
-        uncertainty = float(human_std)
-
-    # Apply calibration to avoid extreme confidence scores
-    # Calibration formula: adjusted = 0.5 + (raw - 0.5) * scaling_factor - uncertainty_penalty
-    scaling_factor = 0.8  # Reduces extreme predictions
-    uncertainty_penalty = uncertainty * 0.3  # Penalize inconsistent predictions
-
-    confidence = 0.5 + (raw_confidence - 0.5) * scaling_factor - uncertainty_penalty
-
-    # Ensure confidence stays in reasonable bounds [0.51, 0.95]
-    confidence = max(0.51, min(0.95, confidence))
-
-    # Average features for explanation
-    avg_features = np.mean(chunk_features, axis=0)
-
-    explanation = generate_explanation(
-        raw_features=avg_features,
-        confidence=confidence,
-        classification=classification
-    )
-
+    # Validate that we have at least one valid chunk
+    if len(ai_probs) == 0:
+        raise ValueError("No valid speech chunks detected")
+    
+    # ===== STEP 7: Aggregate Using Normalized Weighted Log-Odds =====
+    final_ai_prob = normalized_weighted_log_odds(ai_probs, weights)
+    
+    # ===== STEP 8: Classification (Three-Stage Decision) =====
+    classification = final_binary_decision(final_ai_prob, ai_probs)
+    
+    # ===== STEP 9: Confidence (Probability of Predicted Class) =====
+    confidence = final_ai_prob if classification == "AI_GENERATED" else 1 - final_ai_prob
+    
+    # ===== STEP 10: Generate Explanation =====
+    explanation = generate_explanation(final_ai_prob)
+    
+    # ===== RETURN FINAL RESULT =====
     return {
         "classification": classification,
-        "confidenceScore": round(confidence, 2),
+        "confidenceScore": round(float(confidence), 4),
         "explanation": explanation
     }
